@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Geolocation Image Beacon Client</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .status {
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .success { background-color: #d4edda; color: #155724; }
+        .error { background-color: #f8d7da; color: #721c24; }
+        .warning { background-color: #fff3cd; color: #856404; }
+        .info { background-color: #d1ecf1; color: #0c5460; }
+    </style>
+</head>
+<body>
+    <h1>Geolocation Image Beacon Client</h1>
+    
+    <div id="statusContainer">
+        <div id="initialStatus" class="status info">
+            🔄 Requesting geolocation permission...
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const SERVER_URL = 'http://honeymoons.mooo.com';
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY = 2000; // 2 seconds
+
+        class GeolocationImageClient {
+            constructor() {
+                this.retryCount = 0;
+                this.hasSentData = false;
+                this.statusContainer = document.getElementById('statusContainer');
+                this.initialStatus = document.getElementById('initialStatus');
+            }
+
+            // Update status display
+            updateStatus(message, type = 'info') {
+                this.initialStatus.innerHTML = message;
+                this.initialStatus.className = `status ${type}`;
+                console.log(`[${type.toUpperCase()}] ${message}`);
+            }
+
+            // Send geolocation data via image beacon
+            sendGeolocationData(latitude, longitude, accuracy) {
+                if (this.hasSentData) {
+                    console.log('Data already sent, skipping duplicate');
+                    return;
+                }
+
+                const timestamp = new Date().toISOString();
+                const userAgent = navigator.userAgent;
+                
+                // Construct the image URL with geolocation data as query parameters
+                const imgUrl = `${SERVER_URL}/track?` + 
+                    `lat=${encodeURIComponent(latitude)}` +
+                    `&lng=${encodeURIComponent(longitude)}` +
+                    `&acc=${encodeURIComponent(accuracy)}` +
+                    `&ts=${encodeURIComponent(timestamp)}` +
+                    `&ua=${encodeURIComponent(btoa(userAgent))}` +
+                    `&ref=${encodeURIComponent(document.referrer || 'direct')}` +
+                    `&url=${encodeURIComponent(window.location.href)}` +
+                    `&rand=${Math.random()}`; // Cache buster
+
+                this.updateStatus('📡 Sending geolocation data via image beacon...', 'info');
+                console.log('Image URL:', imgUrl);
+
+                // Create and load the tracking image
+                const img = new Image(1, 1); // 1x1 pixel image
+                img.src = imgUrl;
+                
+                img.onload = () => {
+                    this.hasSentData = true;
+                    this.updateStatus(
+                        `✅ Geolocation data sent successfully!<br>
+                         📍 Location: ${latitude.toFixed(6)}, ${longitude.toFixed(6)}<br>
+                         📏 Accuracy: ${accuracy} meters<br>
+                         ⏰ Time: ${new Date(timestamp).toLocaleString()}<br>
+                         🌐 Sent to: honeymoons.mooo.com`,
+                        'success'
+                    );
+                    this.retryCount = 0;
+                };
+
+                img.onerror = () => {
+                    this.retryCount++;
+                    if (this.retryCount < MAX_RETRIES) {
+                        this.updateStatus(
+                            `❌ Failed to send data (attempt ${this.retryCount}/${MAX_RETRIES}). Retrying...`,
+                            'warning'
+                        );
+                        setTimeout(() => this.sendGeolocationData(latitude, longitude, accuracy), RETRY_DELAY);
+                    } else {
+                        this.updateStatus(
+                            `❌ Failed to send geolocation data after ${MAX_RETRIES} attempts.`,
+                            'error'
+                        );
+                    }
+                };
+            }
+
+            // Get current geolocation
+            getGeolocation() {
+                if (!navigator.geolocation) {
+                    this.updateStatus('❌ Geolocation is not supported by this browser.', 'error');
+                    return;
+                }
+
+                const options = {
+                    enableHighAccuracy: true,
+                    timeout: 10000,
+                    maximumAge: 60000
+                };
+
+                this.updateStatus('📍 Requesting geolocation access...', 'info');
+
+                navigator.geolocation.getCurrentPosition(
+                    (position) => {
+                        const lat = position.coords.latitude;
+                        const lon = position.coords.longitude;
+                        const acc = position.coords.accuracy;
+
+                        this.updateStatus('✅ Geolocation access granted!', 'success');
+                        this.sendGeolocationData(lat, lon, acc);
+                    },
+                    (error) => {
+                        this.handleGeolocationError(error);
+                    },
+                    options
+                );
+            }
+
+            // Handle geolocation errors
+            handleGeolocationError(error) {
+                let errorMessage = '';
+                
+                switch(error.code) {
+                    case error.PERMISSION_DENIED:
+                        errorMessage = '❌ Geolocation permission denied by user.';
+                        break;
+                    case error.POSITION_UNAVAILABLE:
+                        errorMessage = '❌ Location information unavailable.';
+                        break;
+                    case error.TIMEOUT:
+                        errorMessage = '❌ Location request timed out.';
+                        break;
+                    default:
+                        errorMessage = '❌ An unknown error occurred.';
+                        break;
+                }
+
+                this.updateStatus(`${errorMessage}<br>Please refresh and allow location access.`, 'error');
+                
+                // Send error notification via image beacon
+                this.sendErrorData(error.code);
+            }
+
+            // Send error data to server
+            sendErrorData(errorCode) {
+                const errorImg = new Image(1, 1);
+                const errorUrl = `${SERVER_URL}/error?` +
+                    `code=${errorCode}` +
+                    `&ua=${encodeURIComponent(btoa(navigator.userAgent))}` +
+                    `&ts=${encodeURIComponent(new Date().toISOString())}` +
+                    `&rand=${Math.random()}`;
+                
+                errorImg.src = errorUrl;
+                console.log('Error image URL:', errorUrl);
+            }
+
+            // Initialize the client
+            init() {
+                this.updateStatus('🚀 Starting geolocation image beacon client...', 'info');
+                
+                // Wait for page to load completely
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', () => this.getGeolocation());
+                } else {
+                    this.getGeolocation();
+                }
+            }
+        }
+
+        // Initialize the client when page loads
+        const client = new GeolocationImageClient();
+        client.init();
+
+        // Optional: Add manual retry button
+        document.addEventListener('DOMContentLoaded', function() {
+            const retryButton = document.createElement('button');
+            retryButton.textContent = '🔄 Retry Geolocation';
+            retryButton.style.cssText = `
+                padding: 10px 20px;
+                background: #007bff;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                cursor: pointer;
+                margin-top: 10px;
+                display: none;
+            `;
+            
+            retryButton.onclick = () => {
+                client.hasSentData = false;
+                client.retryCount = 0;
+                client.getGeolocation();
+            };
+            
+            document.body.appendChild(retryButton);
+            
+            // Show retry button after 5 seconds if still trying
+            setTimeout(() => {
+                if (!client.hasSentData) {
+                    retryButton.style.display = 'block';
+                }
+            }, 5000);
+        });
+    </script>
+</body>
+</html>
